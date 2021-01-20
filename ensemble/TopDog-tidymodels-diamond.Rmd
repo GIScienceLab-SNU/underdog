@@ -1,0 +1,737 @@
+---
+title: 'tidymodels: An end-to-end snapshot'
+author: "TopDog"
+date: 'Spatial Analytics 2: Machine Learning'
+output:
+  rmdformats::readthedown:
+    highlight: haddock
+    self_contained: yes
+    gallery: yes
+    number_sections: yes
+    pandoc_args: --number-offset=0
+    code_folding: show
+    toc_depth: 3
+    lightbox: yes
+editor_options:
+  chunk_output_type: inline
+colorlinks: yes
+---
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+require(knitr); require(rmdformats); require("DT")
+
+options(width="400"); options(max.print="75")
+options(digits=3)
+options(DT.options = list(class="display compact nowrap hover",
+                          rownames=FALSE))
+knitr::opts_chunk$set(
+ echo = TRUE, message = FALSE, warning = FALSE, cache = FALSE,
+ comment = "--> ", collapse = FALSE, prompt = FALSE, tidy = FALSE,
+ background="#FDF2E9", # https://htmlcolorcodes.com/
+ fig.align="center"
+)
+
+par(mar=c(3,3,1,1)+.1)
+
+knitr::opts_knit$set(width=75)
+knitr::knit_hooks$set(webgl = rgl::hook_webgl)
+options(rgl.useNULL=TRUE)
+```
+
+```{r include=FALSE}
+# free memory & and garbage collection
+rm(list = ls()); gc()
+set.seed(1004)
+doParallel::registerDoParallel()
+
+#library(tidylog, warn.conflicts = FALSE) # load this last!
+library("crayon")  # for terminal colors
+crayon <- function(x) cat(paste("    ----> ", red$bold(x)), sep = "\n")
+options("tidylog.display" = list(crayon))
+# options("tidylog.display" = NULL)    # turn on
+# options("tidylog.display" = list())  # turn off
+```
+
+
+![](fig/tidymodels.png)
+https://www.tidymodels.org/
+
+
+`tidymodels::`, as a successor of `caret::`, is a meta-package
+which has a modular approach meaning that 
+specific, smaller packages are designed to work hand in hand.
+
+Thus, 
+```{block type="warning"}
+**tidymodels** is to **modeling** what the **tidyverse** is to **data wrangling**.
+```
+
+Herein, I will walk through a machine learning example from start to end 
+and explain how to use the appropriate tidymodels packages at each place.
+
+# Set Up {-}
+
+Loading the **tidymodels** package loads a bunch of packages 
+for modeling and also a few others from the tidyverse 
+like **ggplot2** and **dplyr**.
+
+```{r warning = FALSE}
+library(tidymodels)
+library(tidyverse)
+ggplot2::theme_set(theme_light())
+library(tidylog, warn.conflicts = FALSE) # load this last!
+
+library(skimr)
+library(patchwork)
+library(gt)
+library(ggrepel)
+```
+
+## Data Set: Diamonds {-}
+
+![](fig/diamond-gia.png)
+With **ggplot2** comes the diamonds data set,
+which has information on the size and quality of diamonds.
+
+```{r}
+data(diamonds, package="ggplot2")
+
+str(diamonds)
+```
+
+A data frame with 53940 rows and 10 variables:
+
+* `price`: price in US dollars (\$326–\$18,823)
+* `carat`:  weight of the diamond (0.2–5.01)
+* `cut`: quality of the cut (Fair, Good, Very Good, Premium, Ideal)
+* `color`: diamond colour, from D (best) to J (worst)
+* `clarity`: a measurement of how clear the diamond is (I1 (worst), SI2, SI1, VS2, VS1, VVS2, VVS1, IF (best))
+
+
+![](fig/GIA-Cut-Scale.png)
+
+
+* `x`: length in mm (0–10.74)
+* `y`: width in mm (0–58.9)
+* `z`: depth in mm (0–31.8)
+* `depth`: total depth percentage = z / mean(x, y) = 2 * z / (x + y) (43–79)
+* `table`: width of top of diamond relative to widest point (43–95)
+
+```{r}
+DT::datatable(sample_n(diamonds, 3000), 
+              caption="ggplot2::diamond dataset (3,000 samples)")
+
+skimr::skim(diamonds)
+```
+
+
+```{block type="note"}
+Herein, we'll use these features to 
+**predict** the **price** of a diamond.
+```
+
+Using the `tidymodels` modules in downstream fashions.
+
+![](fig/ml-downstream.jpg){with=20%}
+
+
+```{r corrplot-diamonds}
+imsi <-  diamonds %>%
+    sample_n(2000) %>% 
+    mutate_if(is.factor, as.numeric) %>%
+    select(price, everything()) 
+
+cor(imsi)
+class(cor(imsi))
+
+ggcorrplot::ggcorrplot(cor(imsi),
+                       hc.order=T,
+                       type="lower",
+                       lab=T) +
+ ggtitle("Correlations between price and various features of diamonds")
+
+cor(imsi) %>%
+    {.[order(abs(.[, 1]), decreasing = TRUE), 
+       order(abs(.[, 1]), decreasing = TRUE)]} %>%
+    corrplot::corrplot(method = "number", 
+             type = "upper", 
+             mar = c(0, 0, 1.5, 0),
+             title = "Correlations between price and various features of diamonds")
+```
+
+
+# Allocating Testing and Training Data: `rsample::`
+
+First of all, we want to extract a data set for testing the predictions in the end.
+We'll only use a small proportion for training (only to speed things up a little).
+Furthermore, the training data set will be prepared for 3-fold cross-validation (using three here to speed things up).
+All this is accomplished using the **rsample** package:
+
+```{r}
+set.seed(1004)
+
+dia_split <- rsample::initial_split(diamonds, 
+                                    prop = .1, 
+                                    strata = price)
+
+class(dia_split)
+dim(dia_split)
+```
+
+```{r}
+dia_train <- rsample::training(dia_split)
+dia_test  <- rsample::testing(dia_split)
+
+dim(dia_train)
+dim(dia_test)
+```
+
+```{r}          
+dia_vfold <- rsample::vfold_cv(dia_train,  
+                               v = 3,  
+                               repeats = 1,  
+                               strata = price) 
+class(dia_vfold)
+dia_vfold
+```
+
+```{r}
+dia_vfold %>% 
+  mutate(df_ana = map(splits, analysis),
+         df_ass = map(splits, assessment))
+```
+
+# Pre-Processing and Feature Engineering: `recipes::`
+
+The **recipes** package can be used to prepare a data set (for modeling)
+using different `step_*()` functions.
+
+For example, the plot below indicates that 
+there may be a nonlinear relationship between price and carat,
+and I want to address that using higher-order terms.
+
+```{r scatter-carat-price}
+p1 <- 
+ ggplot(dia_train, aes(x=price)) +
+ geom_histogram() 
+
+p2 <- 
+ ggplot(dia_train, aes(x=price)) +
+ geom_histogram() +
+ scale_x_continuous(trans=log_trans()) +
+ xlab("log(price)")
+
+p3 <- 
+ ggplot(data = dia_train, mapping=aes(x=carat, y=price)) +
+ geom_point(alpha=0.3) +
+ scale_y_continuous(labels = function(x) round(x, -2)) +
+ geom_smooth(method = "lm", formula = "y ~ poly(x, 4)") +
+ labs(title = "Nonlinear relationship between price and carat of diamonds",
+      subtitle = "The degree of the polynomial is a potential tuning parameter")
+p4 <- 
+ ggplot(data = dia_train, mapping=aes(x=carat, y=price)) +
+ geom_point(alpha=0.3) +
+ scale_y_continuous(trans = log_trans(), 
+                    labels = function(x) round(x, -2)) +
+ geom_smooth(method = "lm", formula = "y ~ poly(x, 4)") +
+ labs(title = "Log transformation of price")
+
+(p1 + p2) / (p3 + p4)
+```
+
+The `recipe()` takes a formula and a data set,
+and then the different steps are added
+using the appropriate `recipe::step_*()` functions.
+
+The **recipes** package comes with a ton of useful step functions
+(see, e.g., `vignette("Simple_Example", package = "recipes")`).
+
+Herein, I want to 
+
+1. log transform price (`step_log()`), 
+2. center and scale all numeric predictors (`step_normalize()`), and 
+3. the categorical predictors should be dummy coded (`step_dummy()`). Furthermore,
+4. a quadratic effect of carat is added using `step_poly()`.
+
+```{r}
+dia_rec <-
+    recipe(price ~ ., data = dia_train) %>%
+    step_log(all_outcomes()) %>%
+    step_normalize(all_predictors(), -all_nominal()) %>%
+    step_dummy(all_nominal()) %>%
+    step_poly(carat, degree = 2)
+
+class(dia_rec)
+dia_rec
+```
+
+`recipe::prep()` ***trains*** a data recipe.
+
+For a recipe with at least one preprocessing operation, 
+estimate the required parameters from a training set 
+that can be later applied to other data sets.
+
+```{r}
+prep(dia_rec)
+```
+
+For a recipe with at least one preprocessing operation 
+that has been trained by `prep()`,
+`recipe::bake()` apply a trained data recipe.
+
+```{r}
+# Note the linear and quadratic term for carat and the dummies for e.g. color
+dia_baked <- bake(prep(dia_rec),
+                   new_data=NULL)
+dim(dia_baked)
+names(dia_baked)
+skimr::skim(dia_baked)
+```
+
+\
+\
+
+***
+
+
+# Defining and Fitting Models: `parsnip::`
+
+The **parsnip** package has wrappers around 
+many popular machine learning algorithms, 
+and you can fit them using a unified interface.
+
+   * For a list of models available via **parsnip**, see https://tidymodels.github.io/parsnip/articles/articles/Models.html.] 
+This is extremely helpful, since you have to remember only one rather then dozens of interfaces.
+
+The models are separated into two modes/categories, namely, 
+**regression** and **classification** (`parsnip::set_mode()`).
+
+The model is defined using a function specific to each algorithm 
+(e.g., `linear_reg()`, `rand_forest()`).
+
+Finally, the backend/engine/implementation is selected 
+using `parsnip::set_engine()`.
+
+Herein, I will start with a basic linear regression model 
+as implemented in `stats::lm()`.
+
+```{r}
+lm_model <-
+    linear_reg() %>%
+    set_mode("regression") %>%
+    set_engine("lm")
+```
+
+Furthermore, take the example of a random forest model.
+
+* This could be fit using packages **ranger::** or **randomForest::**.
+* Both have different interfaces (e.g., argument `ntree` vs. `num.trees`), 
+and **parsnip** removes the hassle of remembering both interfaces.
+
+More general arguments pertaining to the algorithm are specified 
+in the algorithm function (e.g., `rand_forest()`).
+
+Arguments specific to the engine are specified in `set_engine()`.
+
+```{r}
+rand_forest(mtry = 3, trees = 500, min_n = 5) %>%
+    set_mode("regression") %>%
+    set_engine("ranger", importance = "impurity_corrected")
+```
+
+Finally, we can `fit()` the model.
+
+```{r}
+lm_fit1 <- fit(lm_model, 
+               price ~ ., 
+               data=dia_baked)
+lm_fit1
+broom::tidy(lm_fit1)
+broom::tidy(lm_fit1) %>% 
+ gt::gt(tidy(lm_fit1))
+```
+
+You can use `fit()` with a formula (e.g., `price ~ .`) 
+or by specifying `x` and `y`.
+In both cases, I recommend keeping only the variables you need 
+when preparing the data set, since this will prevent
+forgetting the new variable `d` when using `y ~ a + b + c`.
+Unnecessary variables can easily be dropped in the recipe using `step_rm()`.
+
+\
+\
+
+***
+
+# Summarizing Fitted Models: `broom::`
+
+Many models have implemented `summary()` or `coef()` methods.
+However, the output of these is usually not in a tidy format, 
+and the **broom::** package has the aim to resolve this issue.
+
+`broom::glance()` gives us information about the whole model.
+Here, R squared is pretty high and the RMSE equals 
+`r round(glance(lm_fit1$fit)$sigma, 3)`.
+
+```{r}
+broom::glance(lm_fit1$fit) %>% gt()
+```
+
+`broom::tidy()` gives us information about the model parameters, 
+and we see that we have a significant quadratic effect of carat.
+
+```{r}
+tidy(lm_fit1) %>% 
+  arrange(desc(abs(statistic)))
+```
+
+Finally, `broom::augment()` can be used to get model predictions, residuals, etc.
+
+```{r}
+broom::augment(lm_fit1$fit, data = dia_baked)
+
+lm_predicted <- augment(lm_fit1$fit, data = dia_baked) %>% 
+    tibble::rowid_to_column()
+lm_predicted
+
+dplyr::select(lm_predicted, rowid, price, .fitted:.std.resid)
+```
+
+A plot of the predicted vs. actual prices shows 
+small residuals with a few outliers,
+which are not well explained by the model.
+
+```{r actual-vs-predicted-prices}
+ggplot(lm_predicted, aes(.fitted, price)) +
+    geom_point(alpha = .2) +
+    ggrepel::geom_label_repel(aes(label = rowid), 
+                              data = filter(lm_predicted, abs(.resid) > 2)) +
+    labs(title = "Actual vs. Predicted Price of Diamonds")
+```
+
+\
+\
+
+***
+
+# Evaluating Model Performance: `yardstick::`
+
+We already saw performance measures RMSE and R-squared 
+in the output of `glance()` above.
+The **yardstick::** package is specifically designed for such measures 
+for both numeric and categorical outcomes,
+and it plays well with grouped predictions (e.g., from cross-validation).
+
+Let's use **rsample**, **parsnip**, and **yardstick**
+for cross-validation to get a more accurate estimation of RMSE.
+
+In the following pipeline,
+the model is `fit()` separately to the three *analysis data* sets,
+and then the fitted models are used to `predict()`
+on the three corresponding *assessment data* sets
+(i.e., 3-fold cross-validation).
+
+Before that, `rsample::analysis()` and `rsample::assessment()`
+are used to extract the respective folds from `dia_vfold` 
+which is a `rsplit` object made by `rsample::`.
+
+Furthermore, the recipe `dia_rec` is `prep`ped (i.e., trained) 
+using the analysis data of each fold, 
+and this prepped recipe is then applied to the assessment data
+of each fold using `bake()`.
+
+
+```{block type="warning"}
+Preparing the recipe separately for each fold
+(rather than once for the whole training data set `dia_train`)
+guards against ***data leakage***.
+```
+
+* [data leakage](https://machinelearningmastery.com/data-leakage-machine-learning/).
+
+The code in the following chunk makes use of list-columns
+to store all information about the three folds in a single tibble `lm_fit2`,
+and a combination of `dplyr::mutate()` and `purrr::map()` is used
+to "loop" across the three rows of the tibble.
+
+```{r}
+# How does dia_vfold look?
+dia_vfold
+
+# Extract analysis/training and assessment/testing data
+lm_fit2 <- mutate(dia_vfold,
+                  df_ana = map(splits,  analysis),
+                  df_ass = map(splits,  assessment))
+lm_fit2
+
+lm_fit2 <- 
+    lm_fit2 %>% 
+    # prep, juice, bake
+    mutate(
+        recipe = map(df_ana, ~prep(dia_rec, training = .x)),
+        df_ana = map(recipe,  juice),
+        df_ass = map2(recipe, 
+                      df_ass, ~bake(.x, new_data = .y))) %>% 
+    # fit
+    mutate(
+        model_fit  = map(df_ana, ~fit(lm_model, price ~ ., data = .x))) %>% 
+    # predict
+    mutate(
+        model_pred = map2(model_fit, df_ass, ~predict(.x, new_data = .y)))
+  
+select(lm_fit2, id, recipe:model_pred)
+```
+
+Note that the cross-validation code above is a bit lengthy---for didactic purposes.
+Wrapper functions (e.g., from the **tune::** package)
+would lead to more concise code:
+`fit_resamples()` could be used here (without tuning), or
+`tune_grid()` and `tune_bayes()` (see below).
+
+Now, we can extract the actual prices `price` from the assessment data
+and compare them to the predicted prices `.pred`.
+
+Then, the **yardstick::** package comes into play:
+
+* The function `yardstick::metrics()` calculates three different metrics
+for numeric outcomes.
+* Furthermore, it automatically recognizes that
+`lm_preds` is grouped by folds and thus calculates the metrics for each fold.
+
+Across the three folds, we see that the RMSE is a little higher
+and R-squared a little smaller compared to above
+(see output of `glance(lm_fit1$fit)`).
+
+This is expected, since out-of-sample prediction is harder
+but also way more useful.
+
+```{r}
+lm_preds <- 
+    lm_fit2 %>% 
+    mutate(res = map2(df_ass, model_pred, ~data.frame(price = .x$price,
+                                                      .pred = .y$.pred))) %>% 
+    select(id, res) %>% 
+    tidyr::unnest(res) %>% 
+    group_by(id)
+
+lm_preds
+
+yardstick::metrics(lm_preds,
+                   truth = price,
+                   estimate = .pred)
+```
+
+Note that `metrics()` has default measures for numeric and categorical outcomes,
+and here RMSE, R-squared, and the mean absolute difference (MAE) are returned.
+
+You could also use one metric directly like `rmse()`
+or define a custom set of metrics via ` metric_set()`.
+
+
+\
+\
+
+***
+
+# Tuning Model Parameters: `tune::` and `dials::`
+
+Let's get a little bit more involved and do some hyperparameter tuning.
+We turn to a different model, namely, a random forest model.
+
+The **tune** package has functions for doing the actual tuning (e.g., via grid search), while all the parameters and their defaults (e.g., `mtry()`, `neighbors()`) are implemented in **dials**.
+Thus, the two packages can almost only be used in combination.
+
+## Preparing Model for Tuning: `parsnip`
+
+First, I want to tune the `mtry` parameter of a random forest model.
+Thus, the model is defined using **parsnip** as above.
+However, rather than using a default value (i.e., `mtry = NULL`) or one specific value (i.e., `mtry = 3`), we use `tune()` as a placeholder and let cross-validation decide on the best value for `mtry` later on.
+
+As the output indicates, the default minimum of `mtry` is 1 and the maximum depends on the data.
+
+```{r}
+rf_model <- 
+    rand_forest(mtry = tune()) %>%
+    set_mode("regression") %>%
+    set_engine("ranger")
+
+parameters(rf_model)
+mtry()
+```
+
+Thus, this model is not yet ready for fitting.
+You can either specify the maximum for `mtry` yourself using `update()`, or you can use `finalize()` to let the data decide on the maximum.
+
+```{r}
+rf_model %>% 
+    parameters() %>% 
+    update(mtry = mtry(c(1L, 5L)))
+
+rf_model %>% 
+    parameters() %>% 
+    # Here, the maximum of mtry equals the number of predictors, i.e., 24.
+    finalize(x = select(juice(prep(dia_rec)), -price)) %>% 
+    pull("object")
+```
+
+## Preparing Data for Tuning: `recipes`
+
+The second thing I want to tune is the degree of the polynomial for the variable carat.
+As you saw in the plot above, polynomials up to a degree of four seemed well suited for the data.
+However, a simpler model might do equally well, and we want to use cross-validation to decide on the degree that works best.
+
+Similar to tuning parameters in a model, certain aspects of a recipe can be tuned.
+Let's define a second recipe and use `tune()` inside `step_poly()`.
+
+```{r}
+# Note that this recipe cannot be prepped (and baked), since "degree" is a
+# tuning parameter
+dia_rec2 <-
+    recipe(price ~ ., data = dia_train) %>%
+    step_log(all_outcomes()) %>%
+    step_normalize(all_predictors(), -all_nominal()) %>%
+    step_dummy(all_nominal()) %>%
+    step_poly(carat, degree = tune())
+
+dia_rec2 %>% 
+    parameters() %>% 
+    pull("object")
+```
+
+# Combine Everything: `workflows::`
+
+The **workflows** package is designed to bundle together different parts of a machine learning pipeline like a recipe or a model.
+
+First, let's create an initial workflow and add the recipe and the random forest model, both of which have a tuning parameter.
+
+```{r}
+rf_wflow <-
+    workflow() %>%
+    add_model(rf_model) %>%
+    add_recipe(dia_rec2)
+rf_wflow
+```
+
+Second, we need to update the parameters in `rf_wflow`, because the maximum of `mtry` is not yet known and the maximum of `degree` should be four (while three is the default).
+
+```{r}
+rf_param <-
+    rf_wflow %>%
+    parameters() %>%
+    update(mtry = mtry(range = c(3L, 5L)),
+           degree = degree_int(range = c(2L, 4L)))
+rf_param$object
+```
+
+Third, we want to use cross-validation for tuning, that is, to select the best combination of the hyperparameters.
+Bayesian optimization (see [https://tidymodels.github.io/tune/](https://tidymodels.github.io/tune/articles/extras/svm_classification.html)) is recommended for complex tuning problems, and this can be done using `tune_bayes()`.
+
+Herein, however, grid search will suffice.
+To this end, let's create a grid of all necessary parameter combinations.
+
+```{r, eval = T}
+rf_grid <- grid_regular(rf_param, levels = 3)
+rf_grid
+```
+
+Cross-validation and hyperparameter tuning can involve fitting many models.
+Herein, for example, we have to fit 3 x 9 models (folds x parameter combinations).
+To increase speed, we can fit the models in parallel.
+This is directly supported by the **tune** package (see [https://tidymodels.github.io/tune/](https://tidymodels.github.io/tune/articles/extras/optimizations.html#parallel-processing)).
+
+```{r parallelization, eval = FALSE}
+library("doFuture")
+all_cores <- parallel::detectCores(logical = FALSE) - 1
+
+registerDoFuture()
+cl <- makeCluster(all_cores)
+plan(future::cluster, workers = cl)
+```
+
+Then, we can finally start tuning.
+
+```{r, eval = T}
+rf_search <- tune_grid(rf_wflow, grid = rf_grid, resamples = dia_vfold,
+                       param_info = rf_param)
+```
+
+The results can be examined using `autoplot()` and `show_best()`:
+
+```{r hyperparameter-tuning-in-R, eval = T}
+autoplot(rf_search, metric = "rmse") +
+    labs(title = "Results of Grid Search for Two Tuning Parameters of a Random Forest")
+show_best(rf_search, "rmse", n = 9)
+
+select_best(rf_search, metric = "rmse")
+
+select_by_one_std_err(rf_search, mtry, degree, metric = "rmse")
+```
+
+With a cross-validation RMSE of ca. 0.12, the random forest model seems to outperform the linear regression from above.
+Furthermore, 0.12 is (hopefully) a realistic estimate of the out-of-sample error.
+
+### Selecting the Best Model to Make the Final Predictions
+
+We saw above that a quadratic trend was enough to get a good model.
+Furthermore, cross-validation revealed that `mtry = 4` seems to perform well.
+
+To use this combination of hyperparameters, we `fit()` the corresponding model (or workflow, more precisely) on the whole training data set `dia_train`.
+
+```{r}
+rf_param_final <- select_by_one_std_err(rf_search, mtry, degree,
+                                        metric = "rmse")
+
+rf_wflow_final <- finalize_workflow(rf_wflow, rf_param_final)
+
+rf_wflow_final_fit <- fit(rf_wflow_final, data = dia_train)
+```
+
+Now, we want to use this to `predict()` on data never seen before, namely, `dia_test`.
+Unfortunately, `predict(rf_wflow_final_fit, new_data = dia_test)` does not work in the present case, because the outcome is modified in the recipe via `step_log()`.
+
+   * Using (a workflow with) a recipe, which modifies the outcome, for prediction would require skipping the respective recipe step at `bake()` time via `step_log(skip = TRUE)`.
+While this is a good idea for predicting on the test data, it is a bad idea for predicting on the assessment data during cross-validation (see also https://github.com/tidymodels/workflows/issues/31).
+
+Thus, we need a little workaround: 
+The prepped recipe is extracted from the workflow, and this can then be used to `bake()` the testing data.
+This baked data set together with the extracted model can then be used for the final predictions.
+
+```{r}
+dia_rec3     <- pull_workflow_prepped_recipe(rf_wflow_final_fit)
+rf_final_fit <- pull_workflow_fit(rf_wflow_final_fit)
+
+dia_test$.pred <- predict(rf_final_fit, 
+                          new_data = bake(dia_rec3, dia_test))$.pred
+dia_test$logprice <- log(dia_test$price)
+
+metrics(dia_test, truth = logprice, estimate = .pred)
+```
+
+As you can see, we get an RMSE of `r round(pull(rmse(dia_test, truth = log(price), estimate = .pred)), 2)` on the testing data, which is even slightly better compared to the cross-validation RMSE.
+
+## Summary
+
+The tidymodels ecosystem bundles together a set of packages that work hand in hand to solve machine-learning problems from start to end.
+Together with the data-wrangling facilities in the **tidyverse** and the plotting tools from **ggplot2**, this makes for a rich toolbox for every data scientist working with R.
+
+
+## Further Resources
+
+- For further information about each of the tidymodels packages, I recommend the vignettes/articles on the respective package homepage (e.g., https://tidymodels.github.io/recipes/ or https://tidymodels.github.io/tune/).
+- Max Kuhn, one of the developer of tidymodels packages, was interviewed on the [R podcast](https://r-podcast.org/episode/028-max-kuhn/) and on the [DataFramed](https://www.datacamp.com/community/podcast/data-science-pharmaceuticals) podcast.
+
+- [R for Data Science](https://r4ds.had.co.nz/) by Hadley Wickham and Garrett Grolemund covers all the basics of data import, transformation, visualization, and modeling using tidyverse and tidymodels packages.
+- Variable importance (plots) are provided by the package [vip](https://koalaverse.github.io/vip/), which works well in combination with tidymodels packages.
+- Recipe steps for dealing with unbalanced data are provided by the [themis](https://cran.r-project.org/web/packages/themis/index.html) package.
+- There are a few more tidymodels packages that I did not cover herein, like **infer** or **tidytext**. Read more about these at https://tidymodels.github.io/tidymodels/.
+
+
+### Source {-}
+
+This is a modified version of the posting in
+[Tutorial on tidymodels for Machine Learning](https://hansjoerg.me/2020/02/09/tidymodels-for-machine-learning/)
+
+\
+\
+
+

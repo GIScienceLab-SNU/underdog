@@ -1,0 +1,385 @@
+---
+title: 'tidymodels: Boilerplates'
+author: "TopDog"
+date: 'Machine Learning'
+output:
+  rmdformats::readthedown:
+    highlight: haddock
+    self_contained: yes
+    gallery: yes
+    number_sections: yes
+    pandoc_args: --number-offset=0
+    code_folding: show
+    toc_depth: 3
+    lightbox: yes
+editor_options:
+  chunk_output_type: inline
+colorlinks: yes
+---
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+require(knitr); require(rmdformats); require("DT")
+
+options(width="400"); options(max.print="75")
+options(digits=3)
+options(DT.options = list(class="display compact nowrap hover",
+                          rownames=FALSE))
+knitr::opts_chunk$set(
+ echo = TRUE, message = FALSE, warning = FALSE, cache = FALSE,
+ comment = "--> ", collapse = FALSE, prompt = FALSE, tidy = FALSE,
+ background="#FDF2E9", # https://htmlcolorcodes.com/
+ fig.align="center"
+)
+
+par(mar=c(3,3,1,1)+.1)
+
+knitr::opts_knit$set(width=75)
+knitr::knit_hooks$set(webgl = rgl::hook_webgl)
+options(rgl.useNULL=TRUE)
+```
+
+```{r include=FALSE}
+# free memory & and garbage collection
+rm(list = ls()); gc()
+set.seed(1004)
+doParallel::registerDoParallel()
+
+#library(tidylog, warn.conflicts = FALSE) # load this last!
+library("crayon")  # for terminal colors
+crayon <- function(x) cat(paste("    ----> ", red$bold(x)), sep = "\n")
+options("tidylog.display" = list(crayon))
+# options("tidylog.display" = NULL)    # turn on
+# options("tidylog.display" = list())  # turn off
+```
+
+
+https://www.tidymodels.org/
+
+
+
+
+# xgboost template
+
+## library setup
+
+```{r}
+library(tidyverse)
+ggplot2::theme_set(theme_light())
+library(tidylog, warn.conflicts = FALSE) # load this last!
+
+library(skimr)
+library(patchwork)
+library(gt)
+library(janitor) # data cleaning
+
+# install treesnip to allow catboost, lightGBM in parsnip binding
+# remotes::install_github("curso-r/treesnip") 
+
+library(tidymodels)
+# tidymodels
+# library(rsample)
+# library(recipes)
+# library(parsnip)
+# library(tune)
+# library(dials)
+# library(workflows)
+# library(yardstick)
+
+# speed up computation with parrallel processing (optional)
+library(doParallel)
+all_cores <- parallel::detectCores(logical = FALSE)
+registerDoParallel(cores = all_cores)
+
+# set the random seed so we can reproduce any simulated results.
+set.seed(1234)
+```
+
+
+## data setup
+
+```{r}
+# load the housing data and clean names
+library(AmesHousing)
+```
+
+## data cleanup
+
+```{r}
+ames_data <- make_ames() %>%
+    janitor::clean_names()
+```
+
+# Exploratory Data Analysis
+
+At this point we would normally make a few simple plots 
+and summaries of the data to get a high-level understanding of the data.
+
+For simplicity, we are going to cut the EDA process here,
+but, in a real-world analysis, understanding the business problems
+and doing effective EDA are often the most time consuming and crucial aspects of the analysis.
+
+# Allocating training and testing datasets 
+
+Now we split the data into training and test data. 
+Training data is used for the model training and hyperparameter tuning. 
+Once trained, the model can be evaluated against test data to assess accuracy.
+
+
+```{r}
+# Stratify by Sale price 
+ames_split <- rsample::initial_split(
+    ames_data, 
+    prop = 0.8, 
+    strata = sale_price
+)
+```
+
+# Pre-processing 
+
+Preprocessing alters the data to make our model more predictive
+and the training process less compute intensive.
+Many models require careful and extensive variable preprocessing
+to produce accurate predictions.
+
+```{block type="warning"}
+XGBoost, however, is robust against highly skewed and/or correlated data,
+so the amount of preprocessing required with XGBoost is minimal.
+```
+
+Nevertheless, we can still benefit from some preprocessing.
+
+In tidymodels, we use the `recipes::` package
+to define these preprocessing steps, in what is called a ***recipe***.
+
+
+```{r}
+preprocessing_recipe <- 
+    recipes::recipe(sale_price ~ ., data = training(ames_split)) %>%
+    # convert categorical variables to factors
+    recipes::step_string2factor(all_nominal()) %>%
+    # combine low frequency factor levels
+    recipes::step_other(all_nominal(), threshold = 0.01) %>%
+    # remove no variance predictors which provide no predictive information 
+    recipes::step_nzv(all_nominal()) %>%
+    prep()
+```
+
+# Cross validate 
+
+```{r}
+ames_cv_folds <- 
+    recipes::bake(
+        preprocessing_recipe, 
+        new_data = training(ames_split)
+    ) %>%  
+    rsample::vfold_cv(v = 5)
+```
+
+# XGBoost model specification
+
+```{r}
+xgboost_model <- 
+    parsnip::boost_tree(
+        mode = "regression",
+        trees = 1000,
+        min_n = tune(),
+        tree_depth = tune(),
+        learn_rate = tune(),
+        loss_reduction = tune()
+    ) %>%
+    set_engine("xgboost", objective = "reg:squarederror")
+```
+
+# Hyperparameter tuning
+
+## grid specification by dials 
+
+```{r}
+# to fill in the model above
+xgboost_params <- 
+    dials::parameters(
+        min_n(),
+        tree_depth(),
+        learn_rate(),
+        loss_reduction()
+    )
+```
+
+and the grid to look in  Experimental designs for computer experiments 
+are used to construct parameter grids that try to cover the parameter space
+such that any portion of the space has an observed combination
+that is not too far from it.
+
+```{r}
+xgboost_grid <- 
+    dials::grid_max_entropy(
+        xgboost_params, 
+        size = 20 # this started at 60, but even 30 is taking forever!
+    )
+```
+
+To tune our model, we perform grid search over our xgboost_grid’s grid space
+to identify the hyperparameter values that have the lowest prediction error.
+
+# Workflow setup
+
+```{r}
+xgboost_wf <- 
+    workflows::workflow() %>%
+    add_model(xgboost_model) %>% 
+    add_formula(sale_price ~ .)
+```
+
+So far little to no computation has been performed except for
+preprocessing calculations
+
+# Tune the Model
+
+Tuning is where the tidymodels ecosystem of packages really comes together.
+Here is a quick breakdown of the objects passed to the first 4 arguments of
+our call to tune_grid() below:
+
+* "object": xgboost_wf which is a workflow that we defined by
+the parsnip and workflows packages 
+
+* “resamples”: ames_cv_folds as defined by rsample and recipes packages 
+
+* “grid”: xgboost_grid our grid space as defined by the dials package 
+
+* “metric”: the yardstick package defines the metric set used to
+evaluate model performance
+ 
+## hyperparameter tuning
+
+This is where the machine starts to smoke!
+
+```{r}
+if(!file.exists("tuned/xgboost_tuned.rds")) {
+system.time({
+xgboost_tuned <- tune::tune_grid(
+    object = xgboost_wf,
+    resamples = ames_cv_folds,
+    grid = xgboost_grid,
+    metrics = yardstick::metric_set(rmse, rsq, mae),
+    control = tune::control_grid(verbose = TRUE)
+)
+})
+save(xgboost_tuned, file="xgboost_tuned.rds")
+} else {
+  load("tuned/xgboost_tuned.rds")
+}
+```
+
+
+In the above code block tune_grid() performed grid search
+over all our 60 grid parameter combinations defined in
+xgboost_grid and used 5 fold cross validation
+along with rmse (Root Mean Squared Error), rsq (R Squared),
+and mae (Mean Absolute Error) to measure prediction accuracy.
+
+So our tidymodels tuning just fit 60 X 5 = 300 XGBoost models
+each with 1,000 trees all in search of the optimal hyperparameters.
+
+   * Don’t try that on your notebook! 
+
+This is just taking way too long! set it back to 30
+
+These are the hyperparameter values which performed best at minimizing RMSE.
+
+```{r}
+xgboost_tuned %>%
+    tune::show_best(metric = "rmse") 
+
+# Next, isolate the best performing hyperparameter values.
+xgboost_best_params <- xgboost_tuned %>%
+    tune::select_best("rmse")
+xgboost_best_params
+```
+
+# Finalize the XGBoost model to use the best tuning parameters.
+
+
+```{r}
+xgboost_model_final <- xgboost_model %>% 
+    finalize_model(xgboost_best_params)
+```
+
+# Evaluate Performance on Test Data 
+
+We use the rmse (Root Mean Squared Error),
+rsq (R Squared), and mae (Mean Absolute Value) metrics from the yardstick
+package in our model evaluation.
+
+## Tranining data
+
+First let’s evaluate the metrics on the training data
+
+```{r}
+train_processed <- bake(preprocessing_recipe,  new_data = training(ames_split))
+
+train_prediction <- xgboost_model_final %>%
+    # fit the model on all the training data
+    fit(
+        formula = sale_price ~ ., 
+        data    = train_processed
+    ) %>%
+    # predict the sale prices for the training data
+    predict(new_data = train_processed) %>%
+    bind_cols(training(ames_split))
+
+xgboost_score_train <- 
+    train_prediction %>%
+    yardstick::metrics(sale_price, .pred) %>%
+    mutate(.estimate = format(round(.estimate, 2), big.mark = ","))
+
+xgboost_score_train
+```
+
+## Test data
+
+And now for the test data:
+
+```{r}    
+test_processed  <- bake(preprocessing_recipe, 
+                        new_data = testing(ames_split))
+
+test_prediction <- xgboost_model_final %>%
+    # fit the model on all the training data
+    fit(
+        formula = sale_price ~ ., 
+        data    = train_processed
+    ) %>%
+    # use the training model fit to predict the test data
+    predict(new_data = test_processed) %>%
+    bind_cols(testing(ames_split))
+```
+
+Measure the accuracy of our model using `yardstick`.
+
+```{r}
+xgboost_score <- 
+    test_prediction %>%
+    yardstick::metrics(sale_price, .pred) %>%
+    mutate(.estimate = format(round(.estimate, 2), big.mark = ","))
+xgboost_score
+```
+
+To quickly check that there is not an obvious issue with our model’s
+predictions, let’s plot the test data residuals.
+
+
+```{r}
+house_prediction_residual <- test_prediction %>%
+    arrange(.pred) %>%
+    mutate(residual_pct = (sale_price - .pred) / .pred) %>%
+    select(.pred, residual_pct)
+
+ggplot(house_prediction_residual, aes(x = .pred, y = residual_pct)) +
+    geom_point(alpha=0.4) +
+    xlab("Predicted Sale Price") +
+    ylab("Residual (%)") +
+    scale_x_continuous(labels = scales::dollar_format()) +
+    scale_y_continuous(labels = scales::percent)
+```
+
+

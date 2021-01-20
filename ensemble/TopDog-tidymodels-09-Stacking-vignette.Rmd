@@ -1,0 +1,1029 @@
+---
+title: 'tidymodels: Model Stacking'
+author: "TopDog"
+date: 'Machine Learning'
+output:
+  rmdformats::readthedown:
+    highlight: haddock
+    self_contained: yes
+    gallery: yes
+    number_sections: yes
+    pandoc_args: --number-offset=0
+    code_folding: show
+    toc_depth: 3
+    lightbox: yes
+editor_options:
+  chunk_output_type: inline
+colorlinks: yes
+---
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+require(knitr); require(rmdformats); require("DT")
+
+options(width="400"); options(max.print="75")
+options(digits=3)
+options(DT.options = list(class="display compact nowrap hover",
+                          rownames=FALSE))
+knitr::opts_chunk$set(
+ echo = TRUE, message = FALSE, warning = FALSE, cache = FALSE,
+ comment = "--> ", collapse = FALSE, prompt = FALSE, tidy = FALSE,
+ background="#FDF2E9", # https://htmlcolorcodes.com/
+ fig.align="center"
+)
+
+par(mar=c(3,3,1,1)+.1)
+
+knitr::opts_knit$set(width=75)
+knitr::knit_hooks$set(webgl = rgl::hook_webgl)
+options(rgl.useNULL=TRUE)
+```
+
+```{r include=FALSE}
+# free memory & and garbage collection
+rm(list = ls()); gc()
+set.seed(1004)
+
+#library(tidylog, warn.conflicts = FALSE) # load this last!
+library("crayon")  # for terminal colors
+crayon <- function(x) cat(paste("    ----> ", red$bold(x)), sep = "\n")
+options("tidylog.display" = list(crayon))
+# options("tidylog.display" = NULL)    # turn on
+# options("tidylog.display" = list())  # turn off
+```
+
+
+https://www.tidymodels.org/
+
+
+
+
+
+## Setup {-}
+
+```{r}
+library(tidymodels)
+library(stacks)
+# tidymodels
+# library(rsample)
+# library(recipes)
+# library(parsnip)
+# library(tune)
+# library(dials)
+# library(workflows)
+# library(yardstick)
+
+# install treesnip to allow catboost, lightGBM in parsnip binding
+# remotes::install_github("curso-r/treesnip") 
+library(treesnip)
+library(lightgbm)
+
+library(tidyverse)
+
+library(skimr)
+library(patchwork)
+library(gt)
+library(janitor) # data cleaning
+
+
+```
+
+Speed up computation with parrallel processing (optional)
+
+```{r}
+library(doParallel)
+all_cores <- parallel::detectCores(logical = FALSE)
+registerDoParallel(cores = all_cores)
+```
+
+```{r}
+# set the random seed so we can reproduce any simulated results.
+set.seed(1004)
+ggplot2::theme_set(theme_light())
+library(tidylog, warn.conflicts = FALSE) # load this last!
+
+knitr::opts_chunk$set(message = TRUE, warning = TRUE)
+```
+
+# Tidy Model Stacking
+
+## Brief Summary of `stacks::`
+
+<a href='https://stacks.tidymodels.org'><img src='fig/hex-stacks.png' align="right" height="280" /></a>
+
+`stacks::` is an R package for model stacking that aligns with the tidymodels. 
+
+Model stacking is an ensembling method that takes the outputs of many models
+and combines them to generate a new model—referred to as an _ensemble_ in this package 
+— that generates predictions informed by each of its _members_.
+
+The process goes something like this:
+
+1. Define candidate ensemble members using functionality from [rsample](https://rsample.tidymodels.org/), [parsnip](https://parsnip.tidymodels.org/), [workflows](https://workflows.tidymodels.org/), [recipes](https://recipes.tidymodels.org/), and [tune](https://tune.tidymodels.org/)
+2. Initialize a `data_stack` object with `stacks()`  
+3. Iteratively add candidate ensemble members to the `data_stack` with `add_candidates()`  
+4. Evaluate how to combine their predictions with `blend_predictions()` and create `model_stack`
+5. Fit candidate ensemble members with non-zero stacking coefficients with `fit_members()`  
+6. Predict on new data with `predict()`
+
+You can install the  package with the following code: 
+
+```{r, eval = FALSE}
+install.packages("stacks")
+```
+
+Install the (unstable) development version with:
+
+```{r, eval = FALSE}
+remotes::install_github("tidymodels/stacks", ref = "main")
+```
+
+Rather than diving right into the implementation, we'll focus here on how the pieces fit together, conceptually, in building an ensemble with `stacks`.
+
+See [Section 2](#sec2) for an example of how this grammar is implemented!
+
+
+## Grammar of Model Stacking
+
+At the highest level, ensembles are formed from _model definitions_.
+In this package, model definitions are an instance of a minimal [workflow](https://workflows.tidymodels.org/), containing a _model specification_ (as defined in the [parsnip](https://parsnip.tidymodels.org/) package) and, optionally, a _preprocessor_ (as defined in the [recipes](https://recipes.tidymodels.org/) package).
+Model definitions specify the form of candidate ensemble members.
+
+![](fig/model_defs.png)
+
+To be used in the same ensemble, each of these model definitions must share the same _resample_.
+This [rsample](https://rsample.tidymodels.org/) `rset` object, when paired with the model definitions, can be used to generate the tuning/fitting results objects for the candidate _ensemble members_ with tune.
+
+![](fig/candidates.png)
+
+Candidate members first come together in a `data_stack` object through the `add_candidates()` function.
+Principally, these objects are just [tibble](https://tibble.tidyverse.org/)s, where the first column gives the true outcome in the assessment set (the portion of the training set used for model validation), and the remaining columns give the predictions from each candidate ensemble member.
+(When the outcome is numeric, there's only one column per candidate ensemble member.
+Classification requires as many columns per candidate as there are levels in the outcome variable.) They also bring along a few extra attributes to keep track of model definitions.
+
+![](fig/data_stack.png)
+
+Then, the data stack can be evaluated using `blend_predictions()` to determine to how best to combine the outputs from each of the candidate members.
+ In the stacking literature, this process is commonly called _metalearning_.
+
+The outputs of each member are likely highly correlated.
+Thus, depending on the degree of regularization you choose, the coefficients for the inputs of (possibly) many of the members will zero out—their predictions will have no influence on the final output, and those terms will thus be thrown out.
+ 
+
+![](fig/coefs.png)
+
+These stacking coefficients determine which candidate ensemble members will become ensemble members.
+Candidates with non-zero stacking coefficients are then fitted on the whole training set, altogether making up a `model_stack` object.
+
+
+![](fig/class_model_stack.png)
+
+This model stack object, outputted from `fit_members()`, is ready to predict on new data! The trained ensemble members are often referred to as _base models_ in the stacking literature.
+
+The full visual outline for these steps:
+
+![](fig/outline.png) 
+
+The API for the package closely mirrors these ideas.
+
+
+Note that a regularized linear model is one of many possible learning algorithms that could be used to fit a stacked ensemble model.
+For implementations of additional ensemble learning algorithms, see [`h2o::h2o.stackedEnsemble()`](http://docs.h2o.ai/h2o/latest-stable/h2o-r/docs/reference/h2o.stackedEnsemble.html) and [`SuperLearner::SuperLearner()`](https://cran.r-project.org/web/packages/SuperLearner/SuperLearner.pdf).
+
+\
+\
+
+***
+
+# Regression Model Stacking {#sec2}
+
+
+We'll be working through an example of the workflow of model stacking with the stacks package.
+At a high level, the workflow looks something like this:
+
+1. Define candidate ensemble members using functionality from rsample, parsnip, workflows, recipes, and tune
+2. Initialize a `data_stack` object with `stacks()`  
+3. Iteratively add candidate ensemble members to the `data_stack` with `add_candidates()`  
+4. Evaluate how to combine their predictions with `blend_predictions()`  
+5. Fit candidate ensemble members with non-zero stacking coefficients with `fit_members()`  
+6. Predict on new data with `predict()`!  
+
+The package is closely integrated with the rest of the functionality in tidymodels—we'll load those packages as well, in addition to some tidyverse packages to evaluate our results later on.
+
+```{r, eval = FALSE}
+library(tidymodels)
+library(stacks)
+# library(tune)
+# library(rsample)
+# library(parsnip)
+# library(workflows)
+# library(recipes)
+# library(yardstick)
+
+library(tidyverse)
+# library(purrr)
+# library(dplyr)
+# library(tidyr)
+```
+
+
+
+In this example, we'll make use of the `tree_frogs` data exported with `stacks`, giving experimental results on hatching behavior of red-eyed tree frog embryos! 
+
+Red-eyed tree frog (RETF) embryos can hatch earlier than their normal 7ish days if they detect potential predator threat.
+Researchers wanted to determine how, and when, these tree frog embryos were able to detect stimulus from their environment.
+To do so, they subjected the embryos at varying developmental stages to "predator stimulus" by jiggling the embryos with a blunt probe.
+Beforehand, though some of the embryos were treated with gentamicin, a compound that knocks out their lateral line (a sensory organ.) Researcher Julie Jung and her crew found that these factors inform whether an embryo hatches prematurely or not!
+
+
+
+## Dataset
+
+
+**Tree frog embryo hatching data**
+
+   - A dataset containing experimental results on hatching behavior of red-eyed tree frog embryos.
+
+Red-eyed tree frog (RETF) embryos can hatch earlier than their normal 7ish days if they detect potential predator threat. Researchers wanted to determine how, and when, these tree frog embryos were able to detect stimulus from their environment. To do so, they subjected the embryos at varying developmental stages to "predator stimulus" by jiggling the embryos with a blunt probe. Beforehand, though some of the embryos were treated with gentamicin, a compound that knocks out their lateral line (a sensory organ.) Researcher Julie Jung and her crew found that these factors inform whether an embryo hatches prematurely or not!
+
+**Format**
+
+A data frame with 1212 rows and 6 variables:
+
+- `clutch`
+RETFs lay their eggs in gelatinous "clutches" of 30-40 eggs. Eggs with the same clutch ID are siblings of each other! This variable is useful in mixed effects models. (Unordered factor.)
+
+- `treatment`
+The treatment group for the embryo. Either "gentamicin", a compound that knocks out the embryos' lateral line, or "control" for the negative control group (i.e. sensory organs intact). (Character.)
+
+- `reflex`
+A measure of ear function called the vestibulo-ocular reflex, categorized into bins. Ear function increases from factor levels "low", to "mid", to "full". (Ordered factor.)
+
+- `age`
+Age of the embryo, in seconds, at the time that the embryo was jiggled. (Numeric, in seconds.)
+
+- `t_o_d`
+The time of day that the stimulus (i.e. jiggle) was applied. "morning" is 5 a.m. to noon, "afternoon" is noon to 8 p.m., and "night" is 8 p.m. to 5 a.m. (Character.)
+
+- `hatched`
+Whether or not the embryo hatched in response to the jiggling! Either "yes" or "no". (Character.)
+
+- `latency`
+Time elapsed between the stimulus (i.e. jiggling) and hatching in response to the stimulus, in seconds. Missing values indicate that the embryo didn't hatch in response to the stimulus. (Numeric, in seconds.)
+
+
+Red-eyed tree frog (RETF) embryos can hatch earlier than their normal 7ish days if they detect potential predator threat.
+Researchers wanted to determine how, and when, these tree frog embryos were able to detect stimulus from their environment.
+To do so, they subjected the embryos at varying developmental stages to "predator stimulus" by jiggling the embryos with a blunt probe.
+Beforehand, though some of the embryos were treated with gentamicin, a compound that knocks out their lateral line (a sensory organ.) Researcher Julie Jung and her crew found that these factors inform whether an embryo hatches prematurely or not!
+
+In this article, we'll use most all of the variables in `tree_frogs` to predict `reflex`, a measure of ear function called the vestibulo-ocular reflex, categorized into bins.
+Ear function increases from factor levels "low", to "mid", to "full".
+
+```{r, message = FALSE, warning = FALSE}
+data(tree_frogs, package="stacks")
+str(tree_frogs)
+DT::datatable(tree_frogs)
+skimr::skim(tree_frogs)
+```
+
+We'll start out with predicting `latency` (i.e. time to hatch) based on other attributes.
+We'll need to filter out NAs (i.e. cases where the embryo did not hatch) first.
+
+```{r, message = FALSE, warning = FALSE}
+data(tree_frogs, package="stacks")
+
+# subset the data
+tree_frogs <- tree_frogs %>%
+  filter(!is.na(latency)) %>%
+  dplyr::select(-c(clutch, hatched))
+```
+
+```{r}
+# for the sake of quick typing,
+frog <- tree_frogs
+```
+
+Taking a quick look at the data, it seems like the hatch time is pretty closely related to some of our predictors!
+
+```{r, message = FALSE, warning = FALSE}
+library(ggplot2)
+
+ggplot(frog) +
+  aes(x = age, y = latency, color = treatment) +
+  geom_point() +
+  labs(x = "Embryo Age (s)", y = "Time to Hatch (s)", col = "Treatment")
+```
+Let's give this a go!
+
+## Define candidate ensemble members
+
+![](fig/frog-stacked.jpg)
+
+At the highest level, ensembles are formed from _model definitions_.
+In this package, model definitions are an instance of a minimal [`workflow`](https://workflows.tidymodels.org/), containing a _model specification_ (as defined in the [`parsnip`](https://parsnip.tidymodels.org/) package) and, optionally, a _preprocessor_ (as defined in the [`recipes`](https://recipes.tidymodels.org/) package).
+Model definitions specify the form of candidate ensemble members.
+
+
+```{r, echo = FALSE}
+knitr::include_graphics("fig/model_defs.png")
+```
+
+Defining the constituent model definitions is undoubtedly the longest part of building an ensemble with `stacks`.
+If you're familiar with tidymodels "proper," you're probably fine to skip this section, keeping a few things in mind:
+
+* You'll need to save the assessment set predictions and workflow utilized in your `tune_grid()`, `tune_bayes()`, or `fit_resamples()` objects by setting the `control` arguments  `save_pred = TRUE` and `save_workflow = TRUE`.
+Note the use of the `control_stack_*()` convenience functions below!
+* Each model definition must share the same rsample `rset` object.
+
+We'll first start out with splitting up the training data, generating resamples, and setting some options that will be used by each model definition.
+
+```{r}
+# some setup: resampling and a basic recipe
+set.seed(1)
+frog_split <- initial_split(frog)
+frog_split
+class(frog_split)
+str(frog_split)
+
+frog_train <- training(frog_split)
+frog_test  <- testing(frog_split)
+class(frog_train)
+
+set.seed(1)
+frog_folds <- rsample::vfold_cv(frog_train, v = 5)
+class(frog_folds)
+frog_folds
+
+frog_rec <- 
+  recipe(latency ~ ., data = frog_train)
+class(frog_rec)
+frog_rec
+
+  
+frog_metric <- yardstick::metric_set(rmse)
+class(frog_metric)
+frog_metric
+```
+
+Tuning and fitting results for use in ensembles need to be fitted with the control arguments `save_pred = TRUE` and `save_workflow = TRUE`—these settings ensure that the assessment set predictions, as well as the workflow used to fit the resamples, are stored in the resulting object.
+For convenience, stacks supplies some `control_stack_*()` functions to generate the appropriate objects for you. 
+
+![](fig/frog-11.gif)
+
+In this example, we'll be working with `tune_grid()` and `fit_resamples()` from the tune package, so we will use the following control settings:
+
+```{r}
+ctrl_grid <- stacks::control_stack_grid()
+ctrl_grid
+
+ctrl_res  <- stacks::control_stack_resamples()
+ctrl_res
+```
+
+We'll define three different model definitions to try to predict time to hatch—a K-nearest neighbors model (with hyperparameters to tune), a linear model, and a support vector machine model (again, with hyperparameters to tune).
+
+Starting out with K-nearest neighbors, we begin by creating a `parsnip` model specification:
+
+```{r}
+# create a model definition
+knn_spec <-
+  nearest_neighbor(
+    mode = "regression", 
+    neighbors = tune("k")
+  ) %>%
+  set_engine("kknn")
+
+class(knn_spec)
+knn_spec
+```
+
+Note that, since we are tuning over several possible numbers of neighbors, this model specification defines multiple model configurations.
+The specific form of those configurations will be determined when specifying the grid search in `tune_grid()`.
+
+From here, we extend the basic recipe defined earlier to fully specify the form of the design matrix for use in a K-nearest neighbors model:
+
+```{r}
+# extend the recipe
+knn_rec <-
+  frog_rec %>%
+  step_dummy(all_nominal()) %>%
+  step_zv(all_predictors(), skip = TRUE) %>%
+  step_meanimpute(all_numeric(), skip = TRUE) %>%
+  step_normalize(all_numeric(), skip = TRUE)
+
+class(frog_rec)
+frog_rec
+class(knn_rec)
+knn_rec
+```
+
+Starting with the basic recipe, we convert categorical variables to dummy variables, remove column with only one observation, impute missing values in numeric variables using the mean, and normalize numeric predictors.
+Pre-processing instructions for the remaining models are defined similarly.
+
+Now, we combine the model specification and pre-processing instructions defined above to form a `workflow` object:
+
+```{r}
+# add both to a workflow
+knn_wflow <- 
+  workflow() %>% 
+  workflows::add_model(knn_spec) %>%
+  workflows::add_recipe(knn_rec)
+
+class(knn_wflow)
+knn_wflow
+```
+
+Finally, we can make use of the workflow, training set resamples, metric set, and control object to tune our hyperparameters.
+Using the `grid` argument, we specify that we would like to optimize over four possible values of `k` using a grid search.
+
+```{r}
+# tune k and fit to the 5-fold cv
+set.seed(2020)
+knn_res <- 
+  tune::tune_grid(
+    knn_wflow,
+    resamples = frog_folds,
+    metrics = frog_metric,
+    grid = 4,
+    control = ctrl_grid
+  )
+
+class(knn_res)
+knn_res
+
+knn_res[[".metrics"]][[1]]
+```
+
+This `knn_res` object fully specifies the candidate members, and is ready to be included in a `stacks` workflow. 
+
+Now, specifying the linear model, note that we are not optimizing over any hyperparameters.
+Thus, we use the `fit_resamples()` function rather than `tune_grid()` or `tune_bayes()` when fitting to our resamples.
+
+```{r}
+# create a model definition
+lin_reg_spec <-
+  linear_reg() %>%
+  set_engine("lm")
+
+class(lin_reg_spec)
+lin_reg_spec
+
+# extend the recipe
+lin_reg_rec <-
+  frog_rec %>%
+  step_dummy(all_nominal()) %>%
+  step_zv(all_predictors(), skip = TRUE)
+
+lin_reg_rec
+
+
+# add both to a workflow
+lin_reg_wflow <- 
+  workflow() %>%
+  add_model(lin_reg_spec) %>%
+  add_recipe(lin_reg_rec)
+
+# fit to the 5-fold cv
+set.seed(2020)
+lin_reg_res <- 
+  fit_resamples(
+    lin_reg_wflow,
+    resamples = frog_folds,
+    metrics = frog_metric,
+    control = ctrl_res
+  )
+
+lin_reg_res
+```
+
+Finally, putting together the model definition for the support vector machine:
+
+```{r}
+# create a model definition
+svm_spec <- 
+  svm_rbf(
+    cost = tune("cost"), 
+    rbf_sigma = tune("sigma")
+  ) %>%
+  set_engine("kernlab") %>%
+  set_mode("regression")
+
+# extend the recipe
+svm_rec <-
+  frog_rec %>%
+  step_dummy(all_nominal()) %>%
+  step_zv(all_predictors(), skip = TRUE) %>%
+  step_meanimpute(all_numeric(), skip = TRUE) %>%
+  step_corr(all_predictors(), skip = TRUE) %>%
+  step_normalize(all_numeric(), skip = TRUE)
+
+# add both to a workflow
+svm_wflow <- 
+  workflow() %>% 
+  add_model(svm_spec) %>%
+  add_recipe(svm_rec)
+
+# tune cost and sigma and fit to the 5-fold cv
+set.seed(2020)
+svm_res <- 
+  tune_grid(
+    svm_wflow, 
+    resamples = frog_folds, 
+    grid = 6,
+    metrics = frog_metric,
+    control = ctrl_grid
+  )
+
+svm_res
+```
+
+Altogether, we've created three model definitions, where the K-nearest neighbors model definition specifies 4 model configurations, the linear regression specifies 1, and the support vector machine specifies 6.
+
+```{r, echo = FALSE}
+knitr::include_graphics("fig/candidates.png")
+```
+
+With these three model definitions fully specified, we are ready to begin stacking these model configurations.
+(Note that, in most applied settings, one would likely specify many more than 11 candidate members.)
+
+## Putting together a stack
+
+![](fig/frog-ensemble.jpg)
+
+The first step to building an ensemble with stacks is to create a `data_stack` object—in this package, data stacks are tibbles (with some extra attributes) that contain the assessment set predictions for each candidate ensemble member.
+
+```{r, echo = FALSE}
+knitr::include_graphics("fig/data_stack.png")
+```
+
+We can initialize a data stack using the `stacks()` function.
+
+```{r}
+stacks()
+```
+
+The `stacks()` function works sort of like the `ggplot()` constructor from ggplot2—the function creates a basic structure that the object will be built on top of—except you'll pipe the outputs rather than adding them with `+`.
+
+The `add_candidates()` function adds ensemble members to the stack.
+
+```{r}
+frog_data_st <- 
+  stacks() %>%
+  add_candidates(knn_res) %>%
+  add_candidates(lin_reg_res) %>%
+  add_candidates(svm_res)
+
+class(frog_data_st)
+frog_data_st
+```
+
+As mentioned before, under the hood, a `data_stack` object is really just a tibble with some extra attributes.
+Checking out the actual data:
+
+```{r}
+as_tibble(frog_data_st)
+```
+
+The first column gives the first response value, and the remaining columns give the assessment set predictions for each ensemble member.
+Since we're in the regression case, there's only one column per ensemble member.
+In classification settings, there are as many columns as there are levels of the outcome variable per candidate ensemble member.
+
+That's it! We're now ready to evaluate how it is that we need to combine predictions from each candidate ensemble member.
+
+## Fit the stack
+
+![](fig/frog-9.gif)
+
+The outputs from each of these candidate ensemble members are highly correlated, so the `blend_predictions()` function performs regularization to figure out how we can combine the outputs from the stack members to come up with a final prediction.
+
+```{r}
+frog_model_st <-
+  frog_data_st %>%
+  stacks::blend_predictions()
+
+class(frog_model_st)
+frog_model_st
+```
+
+The `blend_predictions` function determines how member model output will ultimately be combined in the final prediction by fitting a LASSO model on the data stack, predicting the true assessment set outcome using the predictions from each of the candidate members.
+Candidates with nonzero stacking coefficients become members.
+
+
+```{r, echo = FALSE}
+knitr::include_graphics("fig/coefs.png")
+```
+
+To make sure that we have the right trade-off between minimizing the number of members and optimizing performance, we can use the `autoplot()` method: 
+
+```{r}
+theme_set(theme_bw())
+autoplot(frog_model_st)
+```
+
+To show the relationship more directly: 
+
+```{r}
+autoplot(frog_model_st, type = "members")
+```
+
+If these results were not good enough, `blend_predictions()` could be called again with different values of `penalty`.
+As it is, `blend_predictions()` picks the penalty parameter with the numerically optimal results.
+To see the top results: 
+
+```{r}
+autoplot(frog_model_st, type = "weights")
+```
+
+Now that we know how to combine our model output, we can fit the candidates with non-zero stacking coefficients on the full training set.
+
+```{r}
+frog_model_st
+
+frog_model_st <-
+  frog_model_st %>%
+  stacks::fit_members()
+
+frog_model_st
+```
+
+```{r, echo = FALSE}
+knitr::include_graphics("fig/members.png")
+```
+
+Model stacks can be thought of as a group of fitted member models and a set of instructions on how to combine their predictions.
+
+```{r, echo = FALSE}
+knitr::include_graphics("fig/class_model_stack.png")
+```
+
+To identify which model configurations were assigned what stacking coefficients, we can make use of the `collect_parameters()` function:
+
+```{r}
+stacks::collect_parameters(frog_model_st, "lin_reg_res")
+stacks::collect_parameters(frog_model_st, "knn_res")
+stacks::collect_parameters(frog_model_st, "svm_res")
+```
+
+This object is now ready to predict with new data!
+
+```{r}
+frog_test <- 
+  frog_test %>%
+  bind_cols(predict(frog_model_st, .))
+```
+
+Juxtaposing the predictions with the true data:
+
+```{r}
+ggplot(frog_test) +
+  aes(x = latency, 
+      y = .pred) +
+  geom_point() + 
+  coord_obs_pred()
+```
+
+Looks like our predictions were pretty strong! How do the stacks predictions perform, though, as compared to the members' predictions? We can use the `type = "members"` argument to generate predictions from each of the ensemble members.
+
+```{r}
+member_preds <- 
+  frog_test %>%
+  dplyr::select(latency) %>%
+  bind_cols(predict(frog_model_st, frog_test, members = TRUE))
+
+member_preds
+```
+
+Now, evaluating the root mean squared error from each model:
+
+```{r}
+yardstick::rmse(member_preds, truth=latency, estimate=.pred)
+
+map_dfr(member_preds, rmse, truth = latency, data = member_preds) %>%
+  mutate(member = colnames(member_preds))
+```
+
+As we can see, the stacked ensemble outperforms each of the member models, though is closely followed by one of its members.
+
+![](fig/frog-8.gif)
+
+
+Voila! You've now made use of the stacks package to predict red-eyed tree frog embryo hatching using a stacked ensemble! 
+
+![](fig/outline.png)
+
+\
+\
+
+***
+
+# Classification Model Stacking 
+
+In this vignette, we'll tackle a multiclass classification problem using the stacks package.
+This vignette assumes that you're familiar with tidymodels "proper," as well as the basic grammar of the package, and have seen it implemented on numeric data; if this is not the case, check out the "Getting Started With stacks" vignette!
+
+```{r, eval = FALSE}
+library(tidymodels)
+library(stacks)
+# library(tune)
+# library(rsample)
+# library(parsnip)
+# library(workflows)
+# library(recipes)
+# library(yardstick)
+
+library(tidyverse)
+# library(purrr)
+# library(dplyr)
+# library(tidyr)
+```
+
+
+![](fig/frog-04.jpg)
+
+
+
+
+## Dataset
+
+
+**Tree frog embryo hatching data**
+
+   - A dataset containing experimental results on hatching behavior of red-eyed tree frog embryos.
+
+Red-eyed tree frog (RETF) embryos can hatch earlier than their normal 7ish days if they detect potential predator threat. Researchers wanted to determine how, and when, these tree frog embryos were able to detect stimulus from their environment. To do so, they subjected the embryos at varying developmental stages to "predator stimulus" by jiggling the embryos with a blunt probe. Beforehand, though some of the embryos were treated with gentamicin, a compound that knocks out their lateral line (a sensory organ.) Researcher Julie Jung and her crew found that these factors inform whether an embryo hatches prematurely or not!
+
+**Format**
+
+A data frame with 1212 rows and 6 variables:
+
+- `clutch`
+RETFs lay their eggs in gelatinous "clutches" of 30-40 eggs. Eggs with the same clutch ID are siblings of each other! This variable is useful in mixed effects models. (Unordered factor.)
+
+- `treatment`
+The treatment group for the embryo. Either "gentamicin", a compound that knocks out the embryos' lateral line, or "control" for the negative control group (i.e. sensory organs intact). (Character.)
+
+- `reflex`
+A measure of ear function called the vestibulo-ocular reflex, categorized into bins. Ear function increases from factor levels "low", to "mid", to "full". (Ordered factor.)
+
+- `age`
+Age of the embryo, in seconds, at the time that the embryo was jiggled. (Numeric, in seconds.)
+
+- `t_o_d`
+The time of day that the stimulus (i.e. jiggle) was applied. "morning" is 5 a.m. to noon, "afternoon" is noon to 8 p.m., and "night" is 8 p.m. to 5 a.m. (Character.)
+
+- `hatched`
+Whether or not the embryo hatched in response to the jiggling! Either "yes" or "no". (Character.)
+
+- `latency`
+Time elapsed between the stimulus (i.e. jiggling) and hatching in response to the stimulus, in seconds. Missing values indicate that the embryo didn't hatch in response to the stimulus. (Numeric, in seconds.)
+
+
+Red-eyed tree frog (RETF) embryos can hatch earlier than their normal 7ish days if they detect potential predator threat.
+Researchers wanted to determine how, and when, these tree frog embryos were able to detect stimulus from their environment.
+To do so, they subjected the embryos at varying developmental stages to "predator stimulus" by jiggling the embryos with a blunt probe.
+Beforehand, though some of the embryos were treated with gentamicin, a compound that knocks out their lateral line (a sensory organ.) Researcher Julie Jung and her crew found that these factors inform whether an embryo hatches prematurely or not!
+
+In this article, we'll use most all of the variables in `tree_frogs` to predict `reflex`, a measure of ear function called the vestibulo-ocular reflex, categorized into bins.
+Ear function increases from factor levels "low", to "mid", to "full".
+
+```{r, message = FALSE, warning = FALSE}
+data(tree_frogs, package="stacks")
+str(tree_frogs)
+DT::datatable(tree_frogs)
+skimr::skim(tree_frogs)
+```
+
+
+```{r}
+# subset the data
+tree_frogs <- tree_frogs %>%
+  dplyr::select(-c(clutch, latency))
+```
+
+```{r}
+# for the sake of quick typing,
+pepe <- tree_frogs
+```
+
+Let's plot the data to get a sense for how separable these groups are.
+
+```{r, message = FALSE, warning = FALSE}
+ggplot(pepe) +
+  aes(x = treatment, y = age, color = reflex) +
+  geom_jitter() +
+  labs(y = "Embryo Age (s)", 
+       x = "treatment",
+       color = "Response")
+```
+
+It looks like the embryo age is pretty effective at picking out embryos with full VOR function, but the problem gets tougher for the less developed embryos! Let's see how well the stacked ensemble can classify these tree frogs.
+
+## Defining candidate ensemble members
+
+![](fig/frog-13.gif)
+
+As in the numeric prediction setting, defining the candidate ensemble members is undoubtedly the longest part of the ensembling process with stacks.
+First, splitting up the training data, generating resamples, and setting some options that will be used by each model definition.
+
+```{r}
+# some setup: resampling and a basic recipe
+set.seed(1)
+
+pepe_split <- initial_split(pepe)
+pepe_train <- training(pepe_split)
+pepe_test  <- testing(pepe_split)
+
+pepe_folds <- rsample::vfold_cv(pepe_train, v = 5)
+
+pepe_rec <- 
+  recipe(reflex ~ ., data = pepe_train) %>%
+  step_dummy(all_nominal(), -reflex) %>%
+  step_zv(all_predictors())
+
+pepe_wflow <- 
+  workflow() %>% 
+  add_recipe(pepe_rec)
+```
+
+We also need to use the same control settings as in the numeric response setting:
+
+```{r}
+ctrl_grid <- control_stack_grid()
+```
+
+We'll define two different model definitions to try to predict `reflex`—a random forest and a neural network.
+
+Starting out with a random forest:
+
+```{r, message = FALSE, warning = FALSE}
+rand_forest_spec <- 
+  rand_forest(
+    mtry = tune(),
+    min_n = tune(),
+    trees = 500
+  ) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+rand_forest_wflow <-
+  pepe_wflow %>%
+  add_model(rand_forest_spec)
+
+rand_forest_res <- 
+  tune_grid(
+    object = rand_forest_wflow, 
+    resamples = pepe_folds, 
+    grid = 10,
+    control = ctrl_grid
+  )
+```
+
+Now, moving on to the neural network model definition:
+
+```{r, message = FALSE, warning = FALSE}
+nnet_spec <-
+  mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("nnet")
+
+nnet_rec <- 
+  pepe_rec %>% 
+  step_normalize(all_predictors())
+
+nnet_wflow <- 
+  pepe_wflow %>%
+  add_model(nnet_spec)
+
+nnet_res <-
+  tune_grid(
+    object = nnet_wflow, 
+    resamples = pepe_folds, 
+    grid = 10,
+    control = ctrl_grid
+  )
+```
+
+With these model definitions fully specified, we're ready to start putting together an ensemble!
+
+## Putting together a stack
+
+![](fig/frog-12.png)
+
+Building the stacked ensemble, now, only takes a few lines:
+
+```{r, message = FALSE, warning = FALSE}
+pepe_model_st <- 
+  stacks() %>%                             # initialize the stack
+  add_candidates(rand_forest_res) %>%      # add candidate members
+  add_candidates(nnet_res) %>%
+  blend_predictions() %>%                  # determine how to combine their predictions
+  fit_members()                            # fit the candidates with nonzero stacking coefficients
+
+pepe_model_st
+```
+
+To make sure that we have the right trade-off between minimizing the number of members and optimizing performance, we can use the `autoplot()` method: 
+
+```{r}
+theme_set(theme_bw())
+autoplot(pepe_model_st)
+```
+
+To show the relationship more directly: 
+
+```{r}
+autoplot(pepe_model_st, type = "members")
+```
+
+If these results were not good enough, `blend_predictions()` could be called again with different values of `penalty`.
+As it is, `blend_predictions()` picks the penalty parameter with the numerically optimal results.
+To see the top results: 
+
+```{r}
+autoplot(pepe_model_st, type = "weights")
+```
+
+There are multiple facets since the ensemble members can have different effects on different classes.
+
+
+To identify which model configurations were assigned what stacking coefficients, we can make use of the `collect_parameters()` function:
+
+```{r}
+collect_parameters(pepe_model_st, "rand_forest_res")
+```
+
+This object is now ready to predict with new data!
+
+```{r, eval = FALSE}
+pepe_pred <-
+  pepe_test %>%
+  bind_cols(predict(pepe_model_st, ., type = "prob"))
+```
+
+Computing the ROC AUC for the model:
+
+```{r, eval = FALSE}
+yardstick::roc_auc(
+  pepe_pred,
+  truth = reflex,
+  contains(".pred_")
+  )
+```
+
+Looks like our predictions were pretty strong! 
+
+![](fig/frog-10.gif)
+
+How do the stacks predictions perform, though, as compared to the members' predictions? 
+
+We can use the `members` argument to generate predictions from each of the ensemble members.
+
+```{r}
+pepe_pred <-
+  pepe_test %>%
+  dplyr::select(reflex) %>%
+  bind_cols(
+    predict(
+      pepe_model_st,
+      pepe_test,
+      type = "class",
+      members = TRUE
+      )
+    )
+
+pepe_pred
+
+map_dfr(
+  setNames(colnames(pepe_pred), colnames(pepe_pred)),
+  ~mean(pepe_pred$reflex == pull(pepe_pred, .x))
+) %>%
+  pivot_longer(c(everything(), -reflex))
+```
+
+Voila! You've now made use of the stacks package to predict tree frog embryo ear function
+using a stacked ensemble!  
+
+
+
+![](fig/frog-gangnam.jpg)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
